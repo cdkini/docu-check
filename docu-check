@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+
+"""
+[PURPOSE]
+    Checks all Docusaurus files in a directory to ensure proper linking (i.e. instances of ```python file=...#L10-20```)
+    Utilizes grep to find all such instances and then compares the staged versions to the versions from HEAD
+    Should account for any shifts or changes in files that would cause line number references to break
+
+[USAGE]
+    ./docu-check [DOCS_DIR]
+    OR docu-check [DOCS_DIR] (if the script is in your PATH)
+
+[DEPENDENCIES]
+    git (must be in a git repo)
+    grep
+    python3
+
+"""
+
+import re
+import subprocess
+import sys
+from typing import Dict, List, Tuple
+
+
+def grep_target_dir(dir: str) -> List[str]:
+    cmd: subprocess.Popen = subprocess.Popen(
+        ["grep", "-nr", "-e" "```python file", "-e", "```yaml file", dir],
+        stdout=subprocess.PIPE,
+    )
+    raw_output: str = cmd.stdout.read().decode("utf-8")
+    return [line for line in raw_output.splitlines() if line]
+
+
+def construct_files_to_check(
+    input_list: List[str],
+) -> Dict[str, Dict[str, List[Tuple[str, str]]]]:
+    files_to_check: Dict[str, Dict[str, List[Tuple[str, str]]]] = {}
+
+    for line in input_list:
+        doc_file, src, _, linked_file, lines = _split([":", "#", ";", "="], line)
+
+        nesting: int = doc_file.count("/")
+        linked_file: str = _get_relative_path(linked_file, nesting)
+
+        _update_files_to_check(files_to_check, doc_file, src, linked_file, lines)
+
+    return files_to_check
+
+
+def _split(delimiters: List[str], string: str) -> List[str]:
+    regexPattern: str = "|".join(map(re.escape, delimiters))
+    vals: List[str] = re.split(regexPattern, string)
+    for i, val in enumerate(vals):
+        vals[i] = val.strip()
+    return vals
+
+
+def _get_relative_path(path: str, nesting: int) -> str:
+    parts: List[str] = path.split("/")
+    return "/".join(part for part in parts[nesting:])
+
+
+def _update_files_to_check(
+    files_to_check: Dict[str, Dict[str, List[Tuple[str, str]]]],
+    doc_file: str,
+    src: str,
+    linked_file: str,
+    lines: str,
+) -> None:
+    if doc_file not in files_to_check:
+        files_to_check[doc_file] = {}
+
+    if linked_file not in files_to_check[doc_file]:
+        files_to_check[doc_file][linked_file] = []
+
+    files_to_check[doc_file][linked_file].append((src, lines))
+
+
+def check_files(files_to_check: Dict[str, Dict[str, List[Tuple[str, str]]]]) -> None:
+    errors: int = 0
+    warnings: int = 0
+    successes: int = 0
+
+    for doc_file, linked_files in files_to_check.items():
+        print(f"\n[CHECKING DOC] {doc_file}")
+        for linked_file, lines in linked_files.items():
+            print(f"    [CHECKING LINK] {linked_file}")
+
+            original: List[str] = _cat_file(linked_file)
+            staged: List[str] = _git_diff_file(linked_file)
+            lines_to_check: List[Tuple[int, List[int]]] = _parse_lines(lines)
+
+            for src, (start, end) in lines_to_check:
+                is_successful: bool = True
+                for line in range(start, end + 1):
+                    line -= 1
+                    if line > len(original) - 1 or line > len(staged):
+                        print(
+                            f"        * WARNING(L{start}-L{end}): Line is out-of-bounds (see docs L{src})"
+                        )
+                        warnings += 1
+                        is_successful = False
+                        break
+                    if original[line] != staged[line]:
+                        print(
+                            f"        * ERROR(L{start}-L{end}): {original[line]} vs {staged[line]} (see docs L{src})"
+                        )
+                        errors += 1
+                        is_successful = False
+                        break
+
+                if is_successful:
+                    successes += 1
+
+    print(
+        f"\nRESULTS: Errors: {errors} | Warnings: {warnings} | Successes: {successes}"
+    )
+
+
+def _parse_lines(lines: List[Tuple[str, str]]) -> List[Tuple[int, List[int]]]:
+    lines_to_check: List[Tuple[int, List[int]]] = []
+    for src, line in lines:
+        nums: List[int] = [int(num) for num in re.findall(r"\d+", line)]
+        if len(nums) == 1:
+            nums.append(nums[0])
+        lines_to_check.append((int(src), nums))
+    return lines_to_check
+
+
+def _git_diff_file(file: str) -> List[str]:
+    cmd: subprocess.Popen = subprocess.Popen(
+        ["git", "show", f"HEAD^^^:{file}"], stdout=subprocess.PIPE
+    )
+    raw_output: List[bytes] = cmd.stdout.readlines()
+    return [str(line) for line in raw_output if line]
+
+
+def _cat_file(file: str) -> List[str]:
+    cmd: subprocess.Popen = subprocess.Popen(["cat", file], stdout=subprocess.PIPE)
+    raw_output: List[bytes] = cmd.stdout.readlines()
+    return [str(line) for line in raw_output if line]
+
+
+def main():
+    input_list: List[str] = grep_target_dir(sys.argv[1])
+    files_to_check: Dict[
+        str, Dict[str, List[Tuple[str, str]]]
+    ] = construct_files_to_check(input_list)
+    check_files(files_to_check)
+
+
+if __name__ == "__main__":
+    main()
